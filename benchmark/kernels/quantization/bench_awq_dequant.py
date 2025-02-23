@@ -4,6 +4,7 @@ import itertools
 
 import torch
 import triton
+import triton.profiler as proton
 from sglang.srt.layers.quantization.awq_dequant import awq_dequantize_triton
 from vllm.model_executor.layers.quantization.awq_triton import awq_dequantize_triton as awq_dequantize_triton_vllm
 import vllm._C
@@ -171,6 +172,8 @@ def benchmark(qweight_row, qweight_col, group_size, provider):
             lambda: awq_dequantize_triton_vllm(qweight, scales, zeros),
             quantiles=quantiles,
         )
+
+    # with proton.scope(f"awq_dequantize_{qweight_row}_{qweight_col}_{group_size}"):
     if provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: awq_dequantize_triton(qweight, scales, zeros),
@@ -198,8 +201,19 @@ if __name__ == "__main__":
         default="./bench_awq_dequant_res",
         help="Path to save awq dequant benchmark results",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true"
+    )
     args = parser.parse_args()
 
     test_accuracy()
 
-    benchmark.run(print_data=True, show_plots=True, save_path=args.save_path)
+    if args.profile:
+        
+        proton.start("awq_dequantize")
+        benchmark.run(print_data=True, show_plots=True, save_path=args.save_path)
+        proton.finalize()
+
+    else:
+        benchmark.run(print_data=True, show_plots=True, save_path=args.save_path)
