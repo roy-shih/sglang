@@ -1,25 +1,23 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 The definition of objects transfered between different
 processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
@@ -28,11 +26,21 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 @dataclass
+class SessionParams:
+    id: Optional[str] = None
+    rid: Optional[str] = None
+    offset: Optional[int] = None
+    replace: Optional[bool] = None
+
+
+@dataclass
 class GenerateReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can either specify text or input_ids.
+    # The token ids for text; one can specify either text or input_ids
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be a file name, a url, or base64 encoded string.
     # See also python/sglang/srt/utils.py:load_image.
     image_data: Optional[Union[List[str], str]] = None
@@ -51,20 +59,32 @@ class GenerateReqInput:
     return_text_in_logprobs: bool = False
     # Whether to stream output.
     stream: bool = False
+    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+    log_metrics: bool = True
+
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    # Session id info for continual prompting
-    session_id: Optional[Union[List[str], str]] = None
-    session_rid: Optional[Union[List[str], str]] = None
+    # Session info for continual prompting
+    session_params: Optional[Union[List[Dict], Dict]] = None
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
     def normalize_batch_and_arguments(self):
-        if (self.text is None and self.input_ids is None) or (
-            self.text is not None and self.input_ids is not None
+        if (
+            self.text is None and self.input_ids is None and self.input_embeds is None
+        ) or (
+            self.text is not None
+            and self.input_ids is not None
+            and self.input_embeds is not None
         ):
-            raise ValueError("Either text or input_ids should be provided.")
+            raise ValueError(
+                "Either text, input_ids or input_embeds should be provided."
+            )
 
         # Derive the batch size
         if self.text is not None:
@@ -74,13 +94,21 @@ class GenerateReqInput:
             else:
                 self.is_single = False
                 self.batch_size = len(self.text)
-        else:
+            self.input_embeds = None
+        elif self.input_ids is not None:
             if isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
             else:
                 self.is_single = False
                 self.batch_size = len(self.input_ids)
+            self.input_embeds = None
+        else:
+            if isinstance(self.input_embeds[0][0], float):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.batch_size = len(self.input_embeds)
 
         # Handle parallel sampling
         # When parallel sampling is used, we always treat the input as a batch.
@@ -159,6 +187,13 @@ class GenerateReqInput:
             else:
                 assert self.parallel_sample_num == 1
 
+            if self.custom_logit_processor is None:
+                self.custom_logit_processor = [None] * num
+            elif not isinstance(self.custom_logit_processor, list):
+                self.custom_logit_processor = [self.custom_logit_processor] * num
+            else:
+                assert self.parallel_sample_num == 1
+
     def regenerate_rid(self):
         self.rid = uuid.uuid4().hex
         return self.rid
@@ -175,8 +210,14 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
+            log_metrics=self.log_metrics,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            custom_logit_processor=(
+                self.custom_logit_processor[i]
+                if self.custom_logit_processor is not None
+                else None
+            ),
         )
 
 
@@ -203,10 +244,16 @@ class TokenizedGenerateReqInput:
 
     # LoRA related
     lora_path: Optional[str] = None  # None means just use the base model
+    # The input embeds
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
-    # Session id info for continual prompting
-    session_id: Optional[int] = None
-    session_rid: Optional[str] = None
+    # Session info for continual prompting
+    session_params: Optional[SessionParams] = None
+
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
+    custom_logit_processor: Optional[str] = None
 
 
 @dataclass
@@ -219,6 +266,10 @@ class EmbeddingReqInput:
     rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
     sampling_params: Union[List[Dict], Dict] = None
+    # Dummy input embeds for compatibility
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+    log_metrics: bool = True
 
     def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
@@ -289,46 +340,74 @@ class TokenizedEmbeddingReqInput:
 class BatchTokenIDOut:
     # The request id
     rids: List[str]
+    # The finish reason
+    finished_reasons: List[BaseFinishReason]
+    # For incremental decoding
     # The version id to sync decode status with in detokenizer_manager
     vids: List[int]
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
-    # Only used when `--skip-tokenizer-init`
+    # Only used when `--skip-tokenizer-init` is on
     output_ids: Optional[List[int]]
+    # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
-    meta_info: List[Dict]
-    finished_reason: List[BaseFinishReason]
     no_stop_trim: List[bool]
-    # The updated session unique id
-    session_ids: List[str]
+
+    # Token counts
+    prompt_tokens: List[int]
+    completion_tokens: List[int]
+    cached_tokens: List[int]
+    spec_verify_ct: List[int]
+
+    # Logprobs
+    input_token_logprobs_val: List[float]
+    input_token_logprobs_idx: List[int]
+    output_token_logprobs_val: List[float]
+    output_token_logprobs_idx: List[int]
+    input_top_logprobs_val: List[List]
+    input_top_logprobs_idx: List[List]
+    output_top_logprobs_val: List[List]
+    output_top_logprobs_idx: List[List]
 
 
 @dataclass
 class BatchStrOut:
     # The request id
     rids: List[str]
+    # The finish reason
+    finished_reasons: List[dict]
     # The output decoded strings
     output_strs: List[str]
-    # The meta info
-    meta_info: List[Dict]
-    # The finish reason
-    finished_reason: List[BaseFinishReason]
-    # The update session unique id
-    session_ids: List[str]
+
+    # Token counts
+    prompt_tokens: List[int]
+    completion_tokens: List[int]
+    cached_tokens: List[int]
+    spec_verify_ct: List[int]
+
+    # Logprobs
+    input_token_logprobs_val: List[float]
+    input_token_logprobs_idx: List[int]
+    output_token_logprobs_val: List[float]
+    output_token_logprobs_idx: List[int]
+    input_top_logprobs_val: List[List]
+    input_top_logprobs_idx: List[List]
+    output_top_logprobs_val: List[List]
+    output_top_logprobs_idx: List[List]
 
 
 @dataclass
 class BatchEmbeddingOut:
     # The request id
     rids: List[str]
+    # The finish reason
+    finished_reasons: List[BaseFinishReason]
     # The output embedding
     embeddings: List[List[float]]
-    # The meta info
-    meta_info: List[Dict]
-    # The finish reason
-    finished_reason: List[BaseFinishReason]
+    # Token counts
+    prompt_tokens: List[int]
 
 
 @dataclass
@@ -337,7 +416,7 @@ class FlushCacheReq:
 
 
 @dataclass
-class UpdateWeightReqInput:
+class UpdateWeightFromDiskReqInput:
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -345,9 +424,86 @@ class UpdateWeightReqInput:
 
 
 @dataclass
-class UpdateWeightReqOutput:
+class UpdateWeightFromDiskReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class UpdateWeightsFromDistributedReqInput:
+    name: str
+    dtype: str
+    shape: List[int]
+
+
+@dataclass
+class UpdateWeightsFromDistributedReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class UpdateWeightsFromTensorReqInput:
+    serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+
+
+@dataclass
+class UpdateWeightsFromTensorReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class InitWeightsUpdateGroupReqInput:
+    # The master address
+    master_address: str
+    # The master port
+    master_port: int
+    # The rank offset
+    rank_offset: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str = "weight_update_group"
+    # The backend
+    backend: str = "nccl"
+
+
+@dataclass
+class InitWeightsUpdateGroupReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class GetWeightsByNameReqInput:
+    name: str
+    truncate_size: int = 100
+
+
+@dataclass
+class GetWeightsByNameReqOutput:
+    parameter: list
+
+
+@dataclass
+class ReleaseMemoryOccupationReqInput:
+    pass
+
+
+@dataclass
+class ReleaseMemoryOccupationReqOutput:
+    pass
+
+
+@dataclass
+class ResumeMemoryOccupationReqInput:
+    pass
+
+
+@dataclass
+class ResumeMemoryOccupationReqOutput:
+    pass
 
 
 @dataclass
@@ -362,18 +518,17 @@ class ProfileReq(Enum):
 
 
 @dataclass
-class GetMemPoolSizeReq:
-    pass
-
-
-@dataclass
-class GetMemPoolSizeReqOutput:
-    size: int
+class ConfigureLoggingReq:
+    log_requests: Optional[bool] = None
+    log_requests_level: Optional[int] = None
+    dump_requests_folder: Optional[str] = None
+    dump_requests_threshold: Optional[int] = None
 
 
 @dataclass
 class OpenSessionReqInput:
     capacity_of_str_len: int
+    session_id: Optional[str] = None
 
 
 @dataclass
@@ -383,4 +538,29 @@ class CloseSessionReqInput:
 
 @dataclass
 class OpenSessionReqOutput:
-    session_id: str
+    session_id: Optional[str]
+    success: bool
+
+
+@dataclass
+class Function:
+    description: Optional[str] = None
+    name: Optional[str] = None
+    parameters: Optional[object] = None
+
+
+@dataclass
+class Tool:
+    function: Function
+    type: Optional[str] = "function"
+
+
+@dataclass
+class FunctionCallReqInput:
+    text: str  # The text to parse.
+    tools: List[Tool] = field(
+        default_factory=list
+    )  # A list of available function tools (name, parameters, etc.).
+    tool_call_parser: Optional[str] = (
+        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+    )

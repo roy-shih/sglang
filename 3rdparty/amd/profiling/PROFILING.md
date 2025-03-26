@@ -336,7 +336,7 @@ loadTracer.sh python3 -m sglang.launch_server \
     --model-path /sgl-workspace/sglang/dummy_grok1 \
     --tokenizer-path Xenova/grok-1-tokenizer \
     --load-format dummy \
-    --quant fp8 \
+    --quantization fp8 \
     --tp 8 \
     --port 30000 \
     --disable-radix-cache 2>&1 | tee "$LOGFILE"
@@ -421,5 +421,5 @@ index 62d1ff9..6ecd78c 100644
 3. Modify the included server.sh by removing "loadTracer.sh" before python command and launch script ./server.sh in one terminal inside the docker container.
 
 4. Similar to step 6 in RPD profiling section, but remove the last 2 lines in client.sh, which converted rpd file into csv and json files. Run modified client.sh for PyTorch profiling.
-=======
+-------
 - [Torch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html)

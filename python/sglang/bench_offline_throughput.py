@@ -14,22 +14,21 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import random
 import time
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
 
-from sglang.api import Engine
 from sglang.bench_serving import (
     get_dataset,
     get_tokenizer,
     sample_random_requests,
     set_ulimit,
 )
-from sglang.srt.server import Runtime
+from sglang.lang.backend.runtime_endpoint import Runtime
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs
 
 
@@ -41,21 +40,22 @@ class BenchArgs:
     dataset_path: str = ""
     num_prompts: int = 1000
     sharegpt_output_len: Optional[int] = None
+    sharegpt_context_len: Optional[int] = None
     random_input_len: int = 1024
     random_output_len: int = 1024
     random_range_ratio: float = 0.0
-    gen_num_groups: int = 64
-    gen_prompts_per_group: int = 16
-    gen_system_prompt_len: int = 2048
-    gen_question_len: int = 128
-    gen_output_len: int = 256
+    gsp_num_groups: int = 64
+    gsp_prompts_per_group: int = 16
+    gsp_system_prompt_len: int = 2048
+    gsp_question_len: int = 128
+    gsp_output_len: int = 256
+    seed: int = 1
     disable_ignore_eos: bool = False
     extra_request_body: Optional[str] = None
-    seed: int = 1
+    apply_chat_template: bool = False
+    profile: bool = False
     skip_warmup: bool = False
     do_not_exit: bool = False
-    profile: bool = False
-    profile_dir: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -86,6 +86,12 @@ class BenchArgs:
             help="Output length for each request. Overrides the output length from the ShareGPT dataset.",
         )
         parser.add_argument(
+            "--sharegpt-context-len",
+            type=int,
+            default=BenchArgs.sharegpt_context_len,
+            help="The context length of the model for the ShareGPT dataset. Requests longer than the context length will be dropped.",
+        )
+        parser.add_argument(
             "--random-input-len",
             type=int,
             default=BenchArgs.random_input_len,
@@ -105,51 +111,62 @@ class BenchArgs:
             "used only for random dataset.",
         )
         parser.add_argument(
-            "--gen-num-groups",
+            "--gsp-num-groups",
             type=int,
-            default=BenchArgs.gen_num_groups,
+            default=BenchArgs.gsp_num_groups,
             help="Number of groups with shared prefix, used"
             "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-prompts-per-group",
+            "--gsp-prompts-per-group",
             type=int,
-            default=BenchArgs.gen_prompts_per_group,
+            default=BenchArgs.gsp_prompts_per_group,
             help="Number of prompts per group of shared prefix, used"
             "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-system-prompt-len",
+            "--gsp-system-prompt-len",
             type=int,
-            default=BenchArgs.gen_system_prompt_len,
+            default=BenchArgs.gsp_system_prompt_len,
             help="System prompt length, used" "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-question-len",
+            "--gsp-question-len",
             type=int,
-            default=BenchArgs.gen_question_len,
+            default=BenchArgs.gsp_question_len,
             help="Question length, used" "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-output-len",
+            "--gsp-output-len",
             type=int,
-            default=BenchArgs.gen_output_len,
+            default=BenchArgs.gsp_output_len,
             help="Target length in tokens for outputs in generated-shared-prefix dataset",
         )
+        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
         parser.add_argument(
             "--disable-ignore-eos",
-            type=bool,
-            default=BenchArgs.disable_ignore_eos,
+            action="store_true",
             help="Disable ignore EOS token",
         )
         parser.add_argument(
             "--extra-request-body",
             metavar='{"key1": "value1", "key2": "value2"}',
             type=str,
+            default=BenchArgs.extra_request_body,
             help="Append given JSON object to the request payload. You can use this to specify"
             "additional generate params like sampling params.",
         )
-        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+        parser.add_argument(
+            "--apply-chat-template",
+            action="store_true",
+            help="Apply chat template",
+        )
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="Use Torch Profiler. The endpoint must be launched with "
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        )
         parser.add_argument(
             "--skip-warmup",
             action="store_true",
@@ -159,20 +176,6 @@ class BenchArgs:
             "--do-not-exit",
             action="store_true",
             help="Do not exit the program. This is useful for nsys profile with --duration and --delay.",
-        )
-        parser.add_argument(
-            "--profile",
-            action="store_true",
-            help="profile the generation process of a single batch",
-        )
-        parser.add_argument(
-            "--profile-dir",
-            type=str,
-            default=None,
-            help=(
-                "path to save the pytorch profiler output. Can be visualized "
-                "with ui.perfetto.dev or Tensorboard."
-            ),
         )
 
     @classmethod
@@ -188,7 +191,6 @@ def throughput_test_once(
     ignore_eos: bool,
     extra_request_body: Dict,
     profile: bool,
-    profile_dir: str,
 ):
     measurement_results = {
         "backend": backend_name,
@@ -213,25 +215,16 @@ def throughput_test_once(
         for r in reqs
     ]
 
-    st = time.perf_counter()
     if profile:
-        if not profile_dir:
-            profile_dir = (
-                Path(".") / "vllm_benchmark_result" / f"latency_result_{time.time()}"
-            )
-        print(f"Profiling (results will be saved to '{profile_dir}')...")
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            with_stack=True,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profile_dir)),
-        ) as p:
-            gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
-    else:
-        gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+        backend.start_profile()
+
+    st = time.perf_counter()
+    gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
     latency = time.perf_counter() - st
+
+    if profile:
+        backend.stop_profile()
+        monitor_trace_file(os.getenv("SGLANG_TORCH_PROFILER_DIR"))
 
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)
@@ -257,6 +250,41 @@ def throughput_test_once(
     return measurement_results
 
 
+def monitor_trace_file(directory, interval=1):
+
+    print(f"Monitoring {directory} for new trace files...")
+
+    known_files = set(os.listdir(directory))
+
+    while True:
+        flag = False
+        time.sleep(interval)
+        current_files = set(os.listdir(directory))
+
+        new_files = current_files - known_files
+        for new_file in new_files:
+            new_file_path = os.path.join(directory, new_file)
+            print(f"New file detected: {new_file}")
+
+            previous_size = 0
+            while True:
+                try:
+                    current_size = os.path.getsize(new_file_path)
+                except FileNotFoundError:
+                    print(f"File {new_file} is no longer accessible.")
+                    break
+
+                if current_size > previous_size:
+                    previous_size = current_size
+                else:
+                    flag = True
+                    break
+
+                time.sleep(interval)
+        if flag:
+            break
+
+
 def throughput_test(
     server_args: ServerArgs,
     bench_args: BenchArgs,
@@ -270,7 +298,7 @@ def throughput_test(
     else:
         raise ValueError('Please set backend to either "engine" or "runtime"')
 
-    tokenizer_id = server_args.model_path
+    tokenizer_id = server_args.tokenizer_path or server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
     # Set global environmnets
@@ -289,8 +317,8 @@ def throughput_test(
     warmup_requests = sample_random_requests(
         input_len=256,
         output_len=16,
-        num_prompts=16,
-        range_ratio=0.8,
+        num_prompts=min(bench_args.num_prompts, 16),
+        range_ratio=1.0,
         tokenizer=tokenizer,
         dataset_path=bench_args.dataset_path,
     )
@@ -304,9 +332,9 @@ def throughput_test(
             reqs=warmup_requests,
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
-            profile=bench_args.profile,
-            profile_dir=bench_args.profile_dir,
+            profile=False,
         )
+        time.sleep(0.5)
 
     logging.info("\nBenchmark...")
     result = throughput_test_once(
@@ -316,8 +344,8 @@ def throughput_test(
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
-        profile_dir=bench_args.profile_dir,
     )
+    backend.shutdown()
 
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:

@@ -1,6 +1,5 @@
 """Public APIs of the language."""
 
-import os
 import re
 from typing import Callable, List, Optional, Union
 
@@ -33,19 +32,15 @@ def function(
 
 
 def Runtime(*args, **kwargs):
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
     # Avoid importing unnecessary dependency
-    from sglang.srt.server import Runtime
+    from sglang.lang.backend.runtime_endpoint import Runtime
 
     return Runtime(*args, **kwargs)
 
 
 def Engine(*args, **kwargs):
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
     # Avoid importing unnecessary dependency
-    from sglang.srt.server import Engine
+    from sglang.srt.entrypoints.engine import Engine
 
     return Engine(*args, **kwargs)
 
@@ -65,7 +60,7 @@ def flush_cache(backend: Optional[BaseBackend] = None):
     return backend.flush_cache()
 
 
-def get_server_args(backend: Optional[BaseBackend] = None):
+def get_server_info(backend: Optional[BaseBackend] = None):
     backend = backend or global_config.default_backend
     if backend is None:
         return None
@@ -73,7 +68,7 @@ def get_server_args(backend: Optional[BaseBackend] = None):
     # If backend is Runtime
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
-    return backend.get_server_args()
+    return backend.get_server_info()
 
 
 def gen(
